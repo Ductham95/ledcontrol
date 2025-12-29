@@ -58,4 +58,5 @@ dependencies {
     debugImplementation(libs.androidx.ui.test.manifest)
     implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
     implementation("androidx.compose.material:material-icons-extended:1.6.0")
+    implementation("com.google.code.gson:gson:2.10.1")
 }

@@ -1,5 +1,7 @@
 package com.example.ledcontrol
 
+import android.content.Context
+import android.content.SharedPreferences
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -8,9 +10,11 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
@@ -21,7 +25,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Lightbulb
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -34,10 +40,14 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import com.example.ledcontrol.ui.theme.LedControlTheme
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import org.eclipse.paho.client.mqttv3.*
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import java.util.UUID
@@ -70,8 +80,54 @@ data class LedState(
 data class ColorPalette(
     val name: String,
     val icon: String,
-    val colors: List<LedState>
+    val colors: List<LedState>,
+    val isCustom: Boolean = false
 )
+
+// Data class for serializable custom preset
+data class CustomPreset(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String,
+    val icon: String,
+    val ledStates: List<LedState>,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+// Helper class to manage custom presets with SharedPreferences
+class PresetManager(context: Context) {
+    private val sharedPrefs: SharedPreferences =
+        context.getSharedPreferences("led_presets", Context.MODE_PRIVATE)
+    private val gson = Gson()
+    private val presetsKey = "custom_presets"
+
+    fun savePreset(preset: CustomPreset) {
+        val presets = getPresets().toMutableList()
+        presets.add(preset)
+        savePresetsList(presets)
+    }
+
+    fun deletePreset(presetId: String) {
+        val presets = getPresets().toMutableList()
+        presets.removeAll { it.id == presetId }
+        savePresetsList(presets)
+    }
+
+    fun getPresets(): List<CustomPreset> {
+        val json = sharedPrefs.getString(presetsKey, null) ?: return emptyList()
+        return try {
+            val type = object : TypeToken<List<CustomPreset>>() {}.type
+            gson.fromJson(json, type) ?: emptyList()
+        } catch (e: Exception) {
+            Log.e("PresetManager", "Error loading presets: ${e.message}")
+            emptyList()
+        }
+    }
+
+    private fun savePresetsList(presets: List<CustomPreset>) {
+        val json = gson.toJson(presets)
+        sharedPrefs.edit().putString(presetsKey, json).apply()
+    }
+}
 
 // Helper function to convert HSV to RGB
 fun hsvToRgb(h: Float, s: Float, v: Float): Triple<Int, Int, Int> {
@@ -273,6 +329,9 @@ fun LedControlScreen(
     onSendColor: (String, Int, Int, Int, Int) -> Unit,
     onSendAllColors: (List<LedState>) -> Unit
 ) {
+    val context = LocalContext.current
+    val presetManager = remember { PresetManager(context) }
+
     var selectedLed by remember { mutableStateOf(0) }
     var ledStates by remember { mutableStateOf(List(24) { LedState(255, 100, 50, 200) }) }
     var red by remember { mutableStateOf(255f) }
@@ -280,6 +339,15 @@ fun LedControlScreen(
     var blue by remember { mutableStateOf(50f) }
     var brightness by remember { mutableStateOf(200f) }
     var showPaletteSelector by remember { mutableStateOf(false) }
+
+    // Custom preset states
+    var customPresets by remember { mutableStateOf(presetManager.getPresets()) }
+    var showSaveDialog by remember { mutableStateOf(false) }
+    var showDeleteConfirmDialog by remember { mutableStateOf<CustomPreset?>(null) }
+
+    // Global brightness mode - when true, brightness slider affects all LEDs
+    var globalBrightnessMode by remember { mutableStateOf(false) }
+    var globalBrightness by remember { mutableStateOf(200f) }
 
     // Preview color with animation
     val previewColor = Color(
@@ -302,7 +370,7 @@ fun LedControlScreen(
     )
 
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(16.dp)
@@ -463,12 +531,100 @@ fun LedControlScreen(
                 onValueChange = { blue = it },
                 gradientColors = listOf(Color(0xFF00001a), Color(0xFF3B82F6))
             )
-            GradientSlider(
-                label = "Brightness",
-                value = brightness,
-                onValueChange = { brightness = it },
-                gradientColors = listOf(Color(0xFF1a1a1a), Color.Yellow)
+
+            HorizontalDivider(
+                modifier = Modifier.padding(vertical = 8.dp),
+                color = Color.White.copy(alpha = 0.1f)
             )
+
+            // Global Brightness Mode Toggle
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "☀️ ",
+                        fontSize = 16.sp
+                    )
+                    Text(
+                        text = if (globalBrightnessMode) "All LEDs Brightness" else "LED $selectedLed Brightness",
+                        color = Color.White,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 14.sp
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "All",
+                        color = if (globalBrightnessMode) AccentCyan else Color.White.copy(alpha = 0.5f),
+                        fontSize = 12.sp
+                    )
+                    Switch(
+                        checked = globalBrightnessMode,
+                        onCheckedChange = {
+                            globalBrightnessMode = it
+                            if (it) {
+                                // When switching to global mode, use current brightness as global
+                                globalBrightness = brightness
+                            }
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = AccentCyan,
+                            checkedTrackColor = AccentCyan.copy(alpha = 0.5f),
+                            uncheckedThumbColor = Color.Gray,
+                            uncheckedTrackColor = Color.Gray.copy(alpha = 0.3f)
+                        ),
+                        modifier = Modifier.padding(horizontal = 8.dp)
+                    )
+                }
+            }
+
+            // Brightness Slider - behavior depends on globalBrightnessMode
+            if (globalBrightnessMode) {
+                GradientSlider(
+                    label = "Global Brightness",
+                    value = globalBrightness,
+                    onValueChange = { newBrightness ->
+                        globalBrightness = newBrightness
+                        // Update all LEDs brightness in real-time
+                        ledStates = ledStates.map { state ->
+                            state.copy(brightness = newBrightness.toInt())
+                        }
+                        brightness = newBrightness
+                    },
+                    gradientColors = listOf(Color(0xFF1a1a1a), Color.Yellow)
+                )
+
+                // Apply to All button for global brightness
+                Button(
+                    onClick = {
+                        // Send all LED colors with the new global brightness
+                        onSendAllColors(ledStates)
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.Yellow.copy(alpha = 0.2f)
+                    ),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                        text = "☀️ Apply Brightness to All LEDs",
+                        color = Color.Yellow,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            } else {
+                GradientSlider(
+                    label = "Brightness",
+                    value = brightness,
+                    onValueChange = { brightness = it },
+                    gradientColors = listOf(Color(0xFF1a1a1a), Color.Yellow)
+                )
+            }
         }
 
         // Preset Palette Selector
@@ -491,19 +647,74 @@ fun LedControlScreen(
                         fontWeight = FontWeight.Bold,
                         fontSize = 14.sp
                     )
-                    TextButton(
-                        onClick = { showPaletteSelector = !showPaletteSelector }
-                    ) {
-                        Text(
-                            text = if (showPaletteSelector) "Hide ▲" else "Show ▼",
-                            color = AccentCyan,
-                            fontSize = 12.sp
-                        )
+                    Row {
+                        // Save current state button
+                        IconButton(
+                            onClick = { showSaveDialog = true }
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Save,
+                                contentDescription = "Save Preset",
+                                tint = AccentGreen
+                            )
+                        }
+                        TextButton(
+                            onClick = { showPaletteSelector = !showPaletteSelector }
+                        ) {
+                            Text(
+                                text = if (showPaletteSelector) "Hide ▲" else "Show ▼",
+                                color = AccentCyan,
+                                fontSize = 12.sp
+                            )
+                        }
                     }
                 }
 
                 if (showPaletteSelector) {
+                    // Custom Presets Section
+                    if (customPresets.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "💾 My Presets",
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(customPresets, key = { it.id }) { preset ->
+                                CustomPresetItem(
+                                    preset = preset,
+                                    onClick = {
+                                        ledStates = preset.ledStates
+                                        val newState = ledStates[selectedLed]
+                                        red = newState.red.toFloat()
+                                        green = newState.green.toFloat()
+                                        blue = newState.blue.toFloat()
+                                        brightness = newState.brightness.toFloat()
+                                        onSendAllColors(ledStates)
+                                    },
+                                    onLongClick = {
+                                        showDeleteConfirmDialog = preset
+                                    }
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
+                    }
+
+                    // Built-in Presets Section
                     Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "🎨 Built-in Presets",
+                        color = Color.White.copy(alpha = 0.7f),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
                     LazyRow(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
@@ -576,6 +787,42 @@ fun LedControlScreen(
 
         Spacer(modifier = Modifier.height(32.dp))
     }
+
+    // Save Preset Dialog
+    if (showSaveDialog) {
+        SavePresetDialog(
+            onDismiss = { showSaveDialog = false },
+            onSave = { name, icon ->
+                // Update current LED state before saving
+                val updatedStates = ledStates.toMutableList().apply {
+                    this[selectedLed] = LedState(red.toInt(), green.toInt(), blue.toInt(), brightness.toInt())
+                }
+                ledStates = updatedStates
+
+                val preset = CustomPreset(
+                    name = name,
+                    icon = icon,
+                    ledStates = updatedStates
+                )
+                presetManager.savePreset(preset)
+                customPresets = presetManager.getPresets()
+                showSaveDialog = false
+            }
+        )
+    }
+
+    // Delete Confirmation Dialog
+    showDeleteConfirmDialog?.let { preset ->
+        DeletePresetDialog(
+            presetName = preset.name,
+            onDismiss = { showDeleteConfirmDialog = null },
+            onConfirm = {
+                presetManager.deletePreset(preset.id)
+                customPresets = presetManager.getPresets()
+                showDeleteConfirmDialog = null
+            }
+        )
+    }
 }
 
 @Composable
@@ -622,6 +869,264 @@ fun PresetPaletteItem(
                                 CircleShape
                             )
                     )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun CustomPresetItem(
+    preset: CustomPreset,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .width(80.dp)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            ),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF21262D))
+    ) {
+        Column(
+            modifier = Modifier.padding(8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = preset.icon,
+                fontSize = 24.sp
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = preset.name,
+                color = Color.White,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            // Preview of preset colors
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                repeat(4) { i ->
+                    val state = preset.ledStates[i * 6]
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .background(
+                                Color(state.red, state.green, state.blue),
+                                CircleShape
+                            )
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SavePresetDialog(
+    onDismiss: () -> Unit,
+    onSave: (name: String, icon: String) -> Unit
+) {
+    var presetName by remember { mutableStateOf("") }
+    var selectedIcon by remember { mutableStateOf("💾") }
+
+    val iconOptions = listOf("💾", "⭐", "❤️", "💜", "💙", "💚", "🧡", "🌟", "🎵", "🏠", "🎮", "🌙")
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = CardBackground)
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = "Save Current State",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Icon selector
+                Text(
+                    text = "Choose an icon",
+                    color = Color.White.copy(alpha = 0.7f),
+                    fontSize = 12.sp
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(iconOptions) { icon ->
+                        Box(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .background(
+                                    if (icon == selectedIcon) AccentPurple.copy(alpha = 0.3f)
+                                    else Color.Transparent,
+                                    CircleShape
+                                )
+                                .border(
+                                    width = if (icon == selectedIcon) 2.dp else 0.dp,
+                                    color = if (icon == selectedIcon) AccentPurple else Color.Transparent,
+                                    shape = CircleShape
+                                )
+                                .clickable { selectedIcon = icon },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(text = icon, fontSize = 20.sp)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Name input
+                OutlinedTextField(
+                    value = presetName,
+                    onValueChange = { presetName = it },
+                    label = { Text("Preset Name", color = Color.White.copy(alpha = 0.7f)) },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AccentCyan,
+                        unfocusedBorderColor = Color.White.copy(alpha = 0.3f),
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        cursorColor = AccentCyan
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(modifier = Modifier.height(20.dp))
+
+                // Buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = Color.White
+                        )
+                    ) {
+                        Text("Cancel")
+                    }
+                    Button(
+                        onClick = {
+                            if (presetName.isNotBlank()) {
+                                onSave(presetName.trim(), selectedIcon)
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        enabled = presetName.isNotBlank(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = AccentGreen,
+                            contentColor = Color.White
+                        )
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Save,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Save")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DeletePresetDialog(
+    presetName: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = CardBackground)
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Delete,
+                    contentDescription = null,
+                    tint = AccentPink,
+                    modifier = Modifier.size(48.dp)
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Text(
+                    text = "Delete Preset?",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Text(
+                    text = "Are you sure you want to delete \"$presetName\"?",
+                    color = Color.White.copy(alpha = 0.7f),
+                    fontSize = 14.sp
+                )
+
+                Spacer(modifier = Modifier.height(20.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = Color.White
+                        )
+                    ) {
+                        Text("Cancel")
+                    }
+                    Button(
+                        onClick = onConfirm,
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = AccentPink,
+                            contentColor = Color.White
+                        )
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Delete,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Delete")
+                    }
                 }
             }
         }
